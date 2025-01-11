@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,9 @@
 
 package io.questdb.metrics;
 
-public interface MetricsRegistry extends Scrapable {
+public interface MetricsRegistry extends Target {
 
-    void addScrapable(Scrapable scrapable);
+    void addTarget(Target target);
 
     Counter newCounter(CharSequence name);
 

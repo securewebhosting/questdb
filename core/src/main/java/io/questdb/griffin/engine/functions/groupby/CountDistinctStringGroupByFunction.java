@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,13 +32,13 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.LongFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
-import io.questdb.std.Chars;
 import io.questdb.std.CompactCharSequenceHashSet;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 
 public class CountDistinctStringGroupByFunction extends LongFunction implements UnaryFunction, GroupByFunction {
     private final Function arg;
+    private final boolean earlyExit;
     private final int setInitialCapacity;
     private final double setLoadFactor;
     private final ObjList<CompactCharSequenceHashSet> sets = new ObjList<>();
@@ -49,6 +49,7 @@ public class CountDistinctStringGroupByFunction extends LongFunction implements 
         this.arg = arg;
         this.setInitialCapacity = setInitialCapacity;
         this.setLoadFactor = setLoadFactor;
+        this.earlyExit = arg.isConstant();
     }
 
     @Override
@@ -69,7 +70,7 @@ public class CountDistinctStringGroupByFunction extends LongFunction implements 
 
         final CharSequence val = arg.getStrA(record);
         if (val != null) {
-            set.add(Chars.toString(val));
+            set.add(val);
             mapValue.putLong(valueIndex, 1L);
         } else {
             mapValue.putLong(valueIndex, 0L);
@@ -89,6 +90,11 @@ public class CountDistinctStringGroupByFunction extends LongFunction implements 
             set.addAt(index, val);
             mapValue.addLong(valueIndex, 1);
         }
+    }
+
+    @Override
+    public boolean earlyExit(MapValue mapValue) {
+        return earlyExit;
     }
 
     @Override
@@ -112,20 +118,30 @@ public class CountDistinctStringGroupByFunction extends LongFunction implements 
     }
 
     @Override
+    public void initValueIndex(int valueIndex) {
+        this.valueIndex = valueIndex;
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
+        this.valueIndex = columnTypes.getColumnCount();
+        columnTypes.add(ColumnType.LONG);
+        columnTypes.add(ColumnType.INT);
+    }
+
+    @Override
     public boolean isConstant() {
         return false;
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return false;
+    public boolean isEarlyExitSupported() {
+        return earlyExit;
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.LONG);
-        columnTypes.add(ColumnType.INT);
+    public boolean isThreadSafe() {
+        return false;
     }
 
     @Override
@@ -140,12 +156,7 @@ public class CountDistinctStringGroupByFunction extends LongFunction implements 
 
     @Override
     public void setNull(MapValue mapValue) {
-        mapValue.putLong(valueIndex, Numbers.LONG_NaN);
-    }
-
-    @Override
-    public void setValueIndex(int valueIndex) {
-        this.valueIndex = valueIndex;
+        mapValue.putLong(valueIndex, Numbers.LONG_NULL);
     }
 
     @Override

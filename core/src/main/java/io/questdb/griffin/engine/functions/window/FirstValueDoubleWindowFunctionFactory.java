@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,12 @@
 
 package io.questdb.griffin.engine.functions.window;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.Reopenable;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
@@ -35,19 +40,22 @@ import io.questdb.cairo.sql.VirtualRecord;
 import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryARW;
-import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.window.WindowContext;
 import io.questdb.griffin.engine.window.WindowFunction;
 import io.questdb.griffin.model.WindowColumn;
-import io.questdb.std.*;
+import io.questdb.std.IntList;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.ObjList;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 
 // Returns value evaluated at the row that is the first row of the window frame.
-public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
+public class FirstValueDoubleWindowFunctionFactory extends AbstractWindowFunctionFactory {
 
-    private static final ArrayColumnTypes FIRST_VALUE_COLUMN_TYPES;
+    protected static final ArrayColumnTypes FIRST_VALUE_COLUMN_TYPES;
 
     private static final String NAME = "first_value";
     private static final String SIGNATURE = NAME + "(D)";
@@ -58,11 +66,6 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public boolean isWindow() {
-        return true;
-    }
-
-    @Override
     public Function newInstance(
             int position,
             ObjList<Function> args,
@@ -70,53 +73,8 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
     ) throws SqlException {
-        final WindowContext windowContext = sqlExecutionContext.getWindowContext();
-        if (windowContext.isEmpty()) {
-            throw SqlException.emptyWindowContext(position);
-        }
-
-        long rowsLo = windowContext.getRowsLo();
-        long rowsHi = windowContext.getRowsHi();
-
-        if (!windowContext.isDefaultFrame()) {
-            if (rowsLo > 0) {
-                throw SqlException.$(windowContext.getRowsLoKindPos(), "frame start supports UNBOUNDED PRECEDING, _number_ PRECEDING and CURRENT ROW only");
-            }
-            if (rowsHi > 0) {
-                if (rowsHi != Long.MAX_VALUE) {
-                    throw SqlException.$(windowContext.getRowsHiKindPos(), "frame end supports _number_ PRECEDING and CURRENT ROW only");
-                } else if (rowsLo != Long.MIN_VALUE) {
-                    throw SqlException.$(windowContext.getRowsHiKindPos(), "frame end supports UNBOUNDED FOLLOWING only when frame start is UNBOUNDED PRECEDING");
-                }
-            }
-        }
-
-        int exclusionKind = windowContext.getExclusionKind();
-        int exclusionKindPos = windowContext.getExclusionKindPos();
-        if (exclusionKind != WindowColumn.EXCLUDE_NO_OTHERS
-                && exclusionKind != WindowColumn.EXCLUDE_CURRENT_ROW) {
-            throw SqlException.$(exclusionKindPos, "only EXCLUDE NO OTHERS and EXCLUDE CURRENT ROW exclusion modes are supported");
-        }
-
-        if (exclusionKind == WindowColumn.EXCLUDE_CURRENT_ROW) {
-            // assumes frame doesn't use 'following'
-            if (rowsHi == Long.MAX_VALUE) {
-                throw SqlException.$(exclusionKindPos, "EXCLUDE CURRENT ROW not supported with UNBOUNDED FOLLOWING frame boundary");
-            }
-
-            if (rowsHi == 0) {
-                rowsHi = -1;
-            }
-            if (rowsHi < rowsLo) {
-                throw SqlException.$(exclusionKindPos, "end of window is higher than start of window due to exclusion mode");
-            }
-        }
-
+        checkWindowParameter(position, sqlExecutionContext);
         int framingMode = windowContext.getFramingMode();
-        if (framingMode == WindowColumn.FRAMING_GROUPS) {
-            throw SqlException.$(position, "function not implemented for given window parameters");
-        }
-
         RecordSink partitionBySink = windowContext.getPartitionBySink();
         ColumnTypes partitionByKeyTypes = windowContext.getPartitionByKeyTypes();
         VirtualRecord partitionByRecord = windowContext.getPartitionByRecord();
@@ -125,7 +83,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
             if (framingMode == WindowColumn.FRAMING_RANGE) {
                 // moving average over whole partition (no order by, default frame) or (order by, unbounded preceding to unbounded following)
                 if (windowContext.isDefaultFrame() && (!windowContext.isOrdered() || windowContext.getRowsHi() == Long.MAX_VALUE)) {
-                    Map map = MapFactory.createOrderedMap(
+                    Map map = MapFactory.createUnorderedMap(
                             configuration,
                             partitionByKeyTypes,
                             FIRST_VALUE_COLUMN_TYPES
@@ -139,7 +97,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                     );
                 } // between unbounded preceding and current row
                 else if (rowsLo == Long.MIN_VALUE && rowsHi == 0) {
-                    Map map = MapFactory.createOrderedMap(
+                    Map map = MapFactory.createUnorderedMap(
                             configuration,
                             partitionByKeyTypes,
                             FIRST_VALUE_COLUMN_TYPES
@@ -167,14 +125,18 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                     columnTypes.add(ColumnType.LONG);   // native buffer capacity
                     columnTypes.add(ColumnType.LONG);   // index of first buffered element
 
-                    Map map = MapFactory.createOrderedMap(
+                    Map map = MapFactory.createUnorderedMap(
                             configuration,
                             partitionByKeyTypes,
                             columnTypes
                     );
 
                     final int initialBufferSize = configuration.getSqlWindowInitialRangeBufferSize();
-                    MemoryARW mem = Vm.getARWInstance(configuration.getSqlWindowStorePageSize(), configuration.getSqlWindowStoreMaxPages(), MemoryTag.NATIVE_CIRCULAR_BUFFER);
+                    MemoryARW mem = Vm.getCARWInstance(
+                            configuration.getSqlWindowStorePageSize(),
+                            configuration.getSqlWindowStoreMaxPages(),
+                            MemoryTag.NATIVE_CIRCULAR_BUFFER
+                    );
 
                     // moving average over range between timestamp - rowsLo and timestamp + rowsHi (inclusive)
                     return new FirstValueOverPartitionRangeFrameFunction(
@@ -192,7 +154,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
             } else if (framingMode == WindowColumn.FRAMING_ROWS) {
                 //between unbounded preceding and current row
                 if (rowsLo == Long.MIN_VALUE && rowsHi == 0) {
-                    Map map = MapFactory.createOrderedMap(
+                    Map map = MapFactory.createUnorderedMap(
                             configuration,
                             partitionByKeyTypes,
                             FIRST_VALUE_COLUMN_TYPES
@@ -209,7 +171,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                     return new FirstValueOverCurrentRowFunction(args.get(0));
                 } // whole partition
                 else if (rowsLo == Long.MIN_VALUE && rowsHi == Long.MAX_VALUE) {
-                    Map map = MapFactory.createOrderedMap(
+                    Map map = MapFactory.createUnorderedMap(
                             configuration,
                             partitionByKeyTypes,
                             FIRST_VALUE_COLUMN_TYPES
@@ -229,14 +191,16 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                     columnTypes.add(ColumnType.LONG);// start offset of native array
                     columnTypes.add(ColumnType.LONG);// count of values in buffer
 
-                    Map map = MapFactory.createOrderedMap(
+                    Map map = MapFactory.createUnorderedMap(
                             configuration,
                             partitionByKeyTypes,
                             columnTypes
                     );
 
-                    MemoryARW mem = Vm.getARWInstance(configuration.getSqlWindowStorePageSize(),
-                            configuration.getSqlWindowStoreMaxPages(), MemoryTag.NATIVE_CIRCULAR_BUFFER
+                    MemoryARW mem = Vm.getCARWInstance(
+                            configuration.getSqlWindowStorePageSize(),
+                            configuration.getSqlWindowStoreMaxPages(),
+                            MemoryTag.NATIVE_CIRCULAR_BUFFER
                     );
 
                     // moving average over preceding N rows
@@ -287,7 +251,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                     return new FirstValueOverCurrentRowFunction(args.get(0));
                 } // between [unbounded | x] preceding and [y preceding | current row]
                 else {
-                    MemoryARW mem = Vm.getARWInstance(
+                    MemoryARW mem = Vm.getCARWInstance(
                             configuration.getSqlWindowStorePageSize(),
                             configuration.getSqlWindowStoreMaxPages(),
                             MemoryTag.NATIVE_CIRCULAR_BUFFER
@@ -391,21 +355,22 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
 
     // Handles first_value() over (partition by x order by ts range between y preceding and [z preceding | current row])
     // Removable cumulative aggregation with timestamp & value stored in resizable ring buffers
-    static class FirstValueOverPartitionRangeFrameFunction extends BasePartitionedDoubleWindowFunction {
+    public static class FirstValueOverPartitionRangeFrameFunction extends BasePartitionedDoubleWindowFunction {
 
-        private static final int RECORD_SIZE = Long.BYTES + Double.BYTES;
-        private final boolean frameIncludesCurrentValue;
-        private final boolean frameLoBounded;
+        protected static final int RECORD_SIZE = Long.BYTES + Double.BYTES;
+        protected final boolean frameIncludesCurrentValue;
+        protected final boolean frameLoBounded;
         // list of [size, startOffset] pairs marking free space within mem
-        private final LongList freeList = new LongList();
-        private final int initialBufferSize;
-        private final long maxDiff;
+        protected final LongList freeList = new LongList();
+        protected final int initialBufferSize;
+        protected final long maxDiff;
         // holds resizable ring buffers
-        private final MemoryARW memory;
-        private final long minDiff;
-        private final int timestampIndex;
+        protected final MemoryARW memory;
+        protected final long minDiff;
+        protected final int timestampIndex;
 
-        private double firstValue;
+        protected double firstValue;
+        protected final RingBufferDesc memoryDesc = new RingBufferDesc();
 
         public FirstValueOverPartitionRangeFrameFunction(
                 Map map,
@@ -508,40 +473,11 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
 
                 // add new element
                 if (size == capacity) { //buffer full
-                    capacity <<= 1;
-
-                    long oldAddress = memory.getPageAddress(0) + startOffset;
-                    long newAddress = -1;
-
-                    // try to find matching block in free list
-                    for (int i = 0, n = freeList.size(); i < n; i += 2) {
-                        if (freeList.getQuick(i) == capacity) {
-                            newAddress = memory.getPageAddress(0) + freeList.getQuick(i + 1);
-                            // replace block info with ours
-                            freeList.setQuick(i, size);
-                            freeList.setQuick(i + 1, startOffset);
-                            break;
-                        }
-                    }
-
-                    if (newAddress == -1) {
-                        newAddress = memory.appendAddressFor(capacity * RECORD_SIZE);
-                        // call above can end up resizing and thus changing memory start address
-                        oldAddress = memory.getPageAddress(0) + startOffset;
-                        freeList.add(size, startOffset);
-                    }
-
-                    if (firstIdx == 0) {
-                        Vect.memcpy(newAddress, oldAddress, size * RECORD_SIZE);
-                    } else {
-                        //we can't simply copy because that'd leave a gap in the middle
-                        long firstPieceSize = (size - firstIdx) * RECORD_SIZE;
-                        Vect.memcpy(newAddress, oldAddress + firstIdx * RECORD_SIZE, firstPieceSize);
-                        Vect.memcpy(newAddress + firstPieceSize, oldAddress, ((firstIdx + size) % size) * RECORD_SIZE);
-                        firstIdx = 0;
-                    }
-
-                    startOffset = newAddress - memory.getPageAddress(0);
+                    memoryDesc.reset(capacity, startOffset, size, firstIdx, freeList);
+                    expandRingBuffer(memory, memoryDesc, RECORD_SIZE);
+                    capacity = memoryDesc.capacity;
+                    startOffset = memoryDesc.startOffset;
+                    firstIdx = memoryDesc.firstIdx;
                 }
 
                 // add element to buffer
@@ -563,15 +499,12 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                         }
                     }
                 } else {
-                    for (long i = 0, n = size; i < n; i++) {
-                        long idx = (firstIdx + i) % capacity;
+                    if (size > 0) {
+                        long idx = firstIdx % capacity;
                         long ts = memory.getLong(startOffset + idx * RECORD_SIZE);
                         if (Math.abs(timestamp - ts) >= minDiff) {
                             frameSize++;
                             newFirstIdx = idx;
-                            break;
-                        } else {
-                            break;
                         }
                     }
 
@@ -654,17 +587,17 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
 
     // handles first_value() over (partition by x [order by o] rows between y and z)
     // removable cumulative aggregation
-    static class FirstValueOverPartitionRowsFrameFunction extends BasePartitionedDoubleWindowFunction {
+    public static class FirstValueOverPartitionRowsFrameFunction extends BasePartitionedDoubleWindowFunction {
 
         //number of values we need to keep to compute over frame
         // (can be bigger than frame because we've to buffer values between rowsHi and current row )
-        private final int bufferSize;
-        private final boolean frameIncludesCurrentValue;
-        private final boolean frameLoBounded;
-        private final int frameSize;
+        protected final int bufferSize;
+        protected final boolean frameIncludesCurrentValue;
+        protected final boolean frameLoBounded;
+        protected final int frameSize;
         // holds fixed-size ring buffers of double values
-        private final MemoryARW memory;
-        private double firstValue;
+        protected final MemoryARW memory;
+        protected double firstValue;
 
         public FirstValueOverPartitionRowsFrameFunction(
                 Map map,
@@ -803,23 +736,24 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
     }
 
     // Handles first_value() over ([order by ts] range between x preceding and [ y preceding | current row ] ); no partition by key
-    static class FirstValueOverRangeFrameFunction extends BaseDoubleWindowFunction implements Reopenable {
-        private final int RECORD_SIZE = Long.BYTES + Double.BYTES;
-        private final boolean frameLoBounded;
-        private final long initialCapacity;
-        private final long maxDiff;
+    public static class FirstValueOverRangeFrameFunction extends BaseDoubleWindowFunction implements Reopenable {
+        protected final int RECORD_SIZE = Long.BYTES + Double.BYTES;
+        protected final boolean frameLoBounded;
+        protected final long initialCapacity;
+        protected final long maxDiff;
         // holds resizable ring buffers
         // actual frame data - [timestamp, value] pairs - is stored in mem at [ offset + first_idx*16, offset + last_idx*16]
         // note: we ignore nulls to reduce memory usage
-        private final MemoryARW memory;
-        private final long minDiff;
-        private final int timestampIndex;
-        private long capacity;
-        private long firstIdx;
-        private double firstValue;
-        private long frameSize;
-        private long size;
-        private long startOffset;
+        protected final MemoryARW memory;
+        protected final long minDiff;
+        protected final int timestampIndex;
+        protected long capacity;
+        protected long firstIdx;
+        protected double firstValue;
+        protected long frameSize;
+        protected long size;
+        protected long startOffset;
+        protected final boolean frameIncludesCurrentValue;
 
         public FirstValueOverRangeFrameFunction(
                 long rangeLo,
@@ -836,10 +770,15 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
             initialCapacity = configuration.getSqlWindowStorePageSize() / RECORD_SIZE;
 
             capacity = initialCapacity;
-            memory = Vm.getARWInstance(configuration.getSqlWindowStorePageSize(), configuration.getSqlWindowStoreMaxPages(), MemoryTag.NATIVE_CIRCULAR_BUFFER);
+            memory = Vm.getCARWInstance(
+                    configuration.getSqlWindowStorePageSize(),
+                    configuration.getSqlWindowStoreMaxPages(),
+                    MemoryTag.NATIVE_CIRCULAR_BUFFER
+            );
             startOffset = memory.appendAddressFor(capacity * RECORD_SIZE) - memory.getPageAddress(0);
             firstIdx = 0;
             frameSize = 0;
+            frameIncludesCurrentValue = rangeHi == 0;
         }
 
         @Override
@@ -915,15 +854,12 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
                     }
                 }
             } else {
-                for (long i = 0, n = size; i < n; i++) {
-                    long idx = (firstIdx + i) % capacity;
+                if (size > 0) {
+                    long idx = firstIdx % capacity;
                     long ts = memory.getLong(startOffset + idx * RECORD_SIZE);
                     if (Math.abs(timestamp - ts) >= minDiff) {
                         frameSize++;
                         newFirstIdx = idx;
-                        break;
-                    } else {
-                        break;
                     }
                 }
                 firstIdx = newFirstIdx;
@@ -1003,18 +939,20 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
 
     // Handles first_value() over ([order by o] rows between y and z); there's no partition by.
     // Removable cumulative aggregation.
-    static class FirstValueOverRowsFrameFunction extends BaseDoubleWindowFunction implements Reopenable {
-        private final MemoryARW buffer;
-        private final int bufferSize;
-        private final boolean frameIncludesCurrentValue;
-        private final boolean frameLoBounded;
-        private final int frameSize;
-        private long count = 0;
-        private double firstValue;
-        private int loIdx = 0;
+    public static class FirstValueOverRowsFrameFunction extends BaseDoubleWindowFunction implements Reopenable {
+        protected final MemoryARW buffer;
+        protected final int bufferSize;
+        protected final boolean frameIncludesCurrentValue;
+        protected final boolean frameLoBounded;
+        protected final int frameSize;
+        protected long count = 0;
+        protected double firstValue;
+        protected int loIdx = 0;
 
         public FirstValueOverRowsFrameFunction(Function arg, long rowsLo, long rowsHi, MemoryARW memory) {
             super(arg);
+
+            assert rowsLo != Long.MIN_VALUE || rowsHi != 0; // use FirstValueOverWholeResultSetFunction in case of (Long.MIN_VALUE, 0) range
 
             if (rowsLo > Long.MIN_VALUE) {
                 frameSize = (int) (rowsHi - rowsLo + (rowsHi < 0 ? 1 : 0));
@@ -1040,7 +978,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
         @Override
         public void computeNext(Record record) {
             if (!frameLoBounded && count > (bufferSize - frameSize)) {
-                firstValue = buffer.getDouble((loIdx + bufferSize - count) * Double.BYTES);
+                firstValue = buffer.getDouble((loIdx + bufferSize - count) % bufferSize * Double.BYTES);
                 return;
             }
 
@@ -1136,7 +1074,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
     // - first_value(a) over (partition by x order by ts range between unbounded preceding and [current row | x preceding])
     static class FirstValueOverUnboundedPartitionRowsFrameFunction extends BasePartitionedDoubleWindowFunction {
 
-        private double value;
+        protected double value;
 
         public FirstValueOverUnboundedPartitionRowsFrameFunction(Map map, VirtualRecord partitionByRecord, RecordSink partitionBySink, Function arg) {
             super(map, partitionByRecord, partitionBySink, arg);
@@ -1181,7 +1119,7 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
 
         @Override
         public void toPlan(PlanSink sink) {
-            sink.val(NAME);
+            sink.val(getName());
             sink.val('(').val(arg).val(')');
             sink.val(" over (");
             sink.val("partition by ");
@@ -1193,14 +1131,13 @@ public class FirstValueDoubleWindowFunctionFactory implements FunctionFactory {
     // handles:
     // first_value() over () - empty clause, no partition by no order by, no frame == default frame
     // first_value() over (rows between unbounded preceding and current row); there's no partition by.
-    static class FirstValueOverWholeResultSetFunction extends BaseDoubleWindowFunction {
-        private boolean found;
-        private double value = Double.NaN;
+    public static class FirstValueOverWholeResultSetFunction extends BaseDoubleWindowFunction {
+        protected boolean found;
+        protected double value = Double.NaN;
 
         public FirstValueOverWholeResultSetFunction(Function arg) {
             super(arg);
         }
-
 
         @Override
         public void computeNext(Record record) {

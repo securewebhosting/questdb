@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,13 +30,40 @@ import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.security.DenyAllSecurityContext;
 import io.questdb.cairo.security.SecurityContextFactory;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.cutlass.http.ex.*;
+import io.questdb.cutlass.http.ex.BufferOverflowException;
+import io.questdb.cutlass.http.ex.NotEnoughLinesException;
+import io.questdb.cutlass.http.ex.RetryFailedOperationException;
+import io.questdb.cutlass.http.ex.RetryOperationException;
+import io.questdb.cutlass.http.ex.TooFewBytesReceivedException;
 import io.questdb.cutlass.http.processors.RejectProcessor;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.network.*;
-import io.questdb.std.*;
-import io.questdb.std.str.*;
+import io.questdb.network.HeartBeatException;
+import io.questdb.network.IOContext;
+import io.questdb.network.IODispatcher;
+import io.questdb.network.IOOperation;
+import io.questdb.network.Net;
+import io.questdb.network.NetworkFacade;
+import io.questdb.network.PeerDisconnectedException;
+import io.questdb.network.PeerIsSlowToReadException;
+import io.questdb.network.PeerIsSlowToWriteException;
+import io.questdb.network.QueryPausedException;
+import io.questdb.network.ServerDisconnectException;
+import io.questdb.network.Socket;
+import io.questdb.network.SocketFactory;
+import io.questdb.network.SuspendEvent;
+import io.questdb.std.AssociativeCache;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.NanosecondClock;
+import io.questdb.std.ObjectPool;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.StdoutSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.TestOnly;
 
@@ -50,7 +77,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private static final Log LOG = LogFactory.getLog(HttpConnectionContext.class);
     private final HttpAuthenticator authenticator;
     private final ChunkedContentParser chunkedContentParser = new ChunkedContentParser();
-    private final HttpContextConfiguration configuration;
+    private final HttpServerConfiguration configuration;
     private final HttpCookieHandler cookieHandler;
     private final ObjectPool<DirectUtf8String> csPool;
     private final boolean dumpNetworkTraffic;
@@ -63,7 +90,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private final long multipartIdleSpinCount;
     private final MultipartParserState multipartParserState = new MultipartParserState();
     private final NetworkFacade nf;
-    private final int recvBufferSize;
+    private final boolean preAllocateBuffers;
     private final RejectProcessor rejectProcessor;
     private final HttpResponseSink responseSink;
     private final RetryAttemptAttributes retryAttemptAttributes = new RetryAttemptAttributes();
@@ -77,6 +104,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private boolean pendingRetry = false;
     private int receivedBytes;
     private long recvBuffer;
+    private int recvBufferSize;
     private long recvPos;
     private HttpRequestProcessor resumeProcessor = null;
     private SecurityContext securityContext;
@@ -85,58 +113,55 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private long totalReceived;
 
     @TestOnly
-    public HttpConnectionContext(HttpMinServerConfiguration configuration, Metrics metrics, SocketFactory socketFactory) {
-        this(configuration, metrics, socketFactory, DefaultHttpCookieHandler.INSTANCE, DefaultHttpHeaderParserFactory.INSTANCE);
+    public HttpConnectionContext(
+            HttpServerConfiguration configuration,
+            SocketFactory socketFactory
+    ) {
+        this(
+                configuration,
+                socketFactory,
+                DefaultHttpCookieHandler.INSTANCE,
+                DefaultHttpHeaderParserFactory.INSTANCE,
+                HttpServer.NO_OP_CACHE
+        );
     }
 
     public HttpConnectionContext(
-            HttpMinServerConfiguration configuration,
-            Metrics metrics,
+            HttpServerConfiguration configuration,
             SocketFactory socketFactory,
             HttpCookieHandler cookieHandler,
-            HttpHeaderParserFactory headerParserFactory
+            HttpHeaderParserFactory headerParserFactory,
+            AssociativeCache<RecordCursorFactory> selectCache
     ) {
         super(
                 socketFactory,
                 configuration.getHttpContextConfiguration().getNetworkFacade(),
-                LOG,
-                metrics.jsonQuery().connectionCountGauge()
+                LOG
         );
-        final HttpContextConfiguration contextConfiguration = configuration.getHttpContextConfiguration();
-        this.configuration = contextConfiguration;
+        this.configuration = configuration;
         this.cookieHandler = cookieHandler;
+        final HttpContextConfiguration contextConfiguration = configuration.getHttpContextConfiguration();
         this.nf = contextConfiguration.getNetworkFacade();
         this.csPool = new ObjectPool<>(DirectUtf8String.FACTORY, contextConfiguration.getConnectionStringPoolCapacity());
         this.headerParser = headerParserFactory.newParser(contextConfiguration.getRequestHeaderBufferSize(), csPool);
         this.multipartContentHeaderParser = new HttpHeaderParser(contextConfiguration.getMultipartHeaderBufferSize(), csPool);
         this.multipartContentParser = new HttpMultipartContentParser(multipartContentHeaderParser);
-        this.responseSink = new HttpResponseSink(contextConfiguration);
-        this.recvBufferSize = contextConfiguration.getRecvBufferSize();
+        this.responseSink = new HttpResponseSink(configuration);
+        this.recvBufferSize = configuration.getRecvBufferSize();
+        this.preAllocateBuffers = configuration.preAllocateBuffers();
+        if (preAllocateBuffers) {
+            recvBuffer = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            this.responseSink.open(configuration.getSendBufferSize());
+        }
         this.multipartIdleSpinCount = contextConfiguration.getMultipartIdleSpinCount();
         this.dumpNetworkTraffic = contextConfiguration.getDumpNetworkTraffic();
         // This is default behaviour until the security context is overridden with correct principal.
         this.securityContext = DenyAllSecurityContext.INSTANCE;
-        this.metrics = metrics;
+        this.metrics = contextConfiguration.getMetrics();
         this.authenticator = contextConfiguration.getFactoryProvider().getHttpAuthenticatorFactory().getHttpAuthenticator();
         this.rejectProcessor = contextConfiguration.getFactoryProvider().getRejectProcessorFactory().getRejectProcessor(this);
         this.forceFragmentationReceiveChunkSize = contextConfiguration.getForceRecvFragmentationChunkSize();
-
-        if (configuration instanceof HttpServerConfiguration) {
-            final HttpServerConfiguration serverConfiguration = (HttpServerConfiguration) configuration;
-            final boolean enableQueryCache = serverConfiguration.isQueryCacheEnabled();
-            final int blockCount = enableQueryCache ? serverConfiguration.getQueryCacheBlockCount() : 1;
-            final int rowCount = enableQueryCache ? serverConfiguration.getQueryCacheRowCount() : 1;
-            this.selectCache = new AssociativeCache<>(
-                    blockCount,
-                    rowCount,
-                    metrics.jsonQuery().cachedQueriesGauge(),
-                    metrics.jsonQuery().cacheHitCounter(),
-                    metrics.jsonQuery().cacheMissCounter()
-            );
-        } else {
-            // Min server doesn't need select cache, so we use no-op settings.
-            this.selectCache = new AssociativeCache<>(1, 1);
-        }
+        this.selectCache = selectCache;
     }
 
     @Override
@@ -148,7 +173,12 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             LOG.error().$("reused context with retry pending").$();
         }
         this.pendingRetry = false;
-        this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+        if (!preAllocateBuffers) {
+            this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            this.responseSink.close();
+            this.headerParser.close();
+            this.multipartContentHeaderParser.close();
+        }
         this.localValueMap.disconnect();
     }
 
@@ -159,7 +189,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
     @Override
     public void close() {
-        final int fd = getFd();
+        final long fd = getFd();
         LOG.debug().$("close [fd=").$(fd).I$();
         super.close();
         if (this.pendingRetry) {
@@ -183,7 +213,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     }
 
     @Override
-    public void fail(HttpRequestProcessorSelector selector, HttpException e) throws PeerIsSlowToReadException, ServerDisconnectException, PeerDisconnectedException {
+    public void fail(HttpRequestProcessorSelector selector, HttpException e) throws PeerIsSlowToReadException, ServerDisconnectException {
         LOG.info().$("failed to retry query [fd=").$(getFd()).I$();
         HttpRequestProcessor processor = getHttpRequestProcessor(selector);
         failProcessor(processor, e, DISCONNECT_REASON_RETRY_FAILED);
@@ -252,6 +282,10 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return totalBytesSent;
     }
 
+    public long getTotalReceived() {
+        return totalReceived;
+    }
+
     public boolean handleClientOperation(int operation, HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
             throws HeartBeatException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         boolean keepGoing;
@@ -270,7 +304,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
         boolean useful = keepGoing;
         if (keepGoing) {
-            if (configuration.getServerKeepAlive()) {
+            if (configuration.getHttpContextConfiguration().getServerKeepAlive()) {
                 do {
                     keepGoing = handleClientRecv(selector, rescheduleContext);
                 } while (keepGoing);
@@ -296,13 +330,18 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     }
 
     @Override
-    public HttpConnectionContext of(int fd, @NotNull IODispatcher<HttpConnectionContext> dispatcher) {
+    public HttpConnectionContext of(long fd, @NotNull IODispatcher<HttpConnectionContext> dispatcher) {
         super.of(fd, dispatcher);
         // The context is obtained from the pool, so we should initialize the memory.
         if (recvBuffer == 0) {
+            // re-read recv buffer size in case the config was reloaded
+            recvBufferSize = configuration.getRecvBufferSize();
             recvBuffer = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
         }
-        responseSink.of(socket);
+        // re-read buffer sizes in case the config was reloaded
+        responseSink.of(socket, configuration.getSendBufferSize());
+        headerParser.reopen(configuration.getHttpContextConfiguration().getRequestHeaderBufferSize());
+        multipartContentHeaderParser.reopen(configuration.getHttpContextConfiguration().getMultipartHeaderBufferSize());
         return this;
     }
 
@@ -350,7 +389,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         responseSink.resumeSend();
     }
 
-    public void scheduleRetry(HttpRequestProcessor processor, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, ServerDisconnectException, PeerDisconnectedException {
+    public void scheduleRetry(HttpRequestProcessor processor, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, ServerDisconnectException {
         try {
             pendingRetry = true;
             rescheduleContext.reschedule(this);
@@ -360,7 +399,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     }
 
     public HttpResponseSink.SimpleResponseImpl simpleResponse() {
-        return responseSink.getSimple();
+        return responseSink.simpleResponse();
     }
 
     public boolean tryRerun(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, PeerIsSlowToWriteException, ServerDisconnectException {
@@ -416,9 +455,9 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
     @SuppressWarnings("StatementWithEmptyBody")
     private void busyRcvLoop(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
-            throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
+            throws PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         reset();
-        if (configuration.getServerKeepAlive()) {
+        if (configuration.getHttpContextConfiguration().getServerKeepAlive()) {
             while (handleClientRecv(selector, rescheduleContext)) ;
         } else {
             throw registerDispatcherDisconnect(DISCONNECT_REASON_KEEPALIVE_OFF);
@@ -433,7 +472,6 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             long contentLength,
             boolean multipartProcessor
     ) {
-
         if (processor.isErrorProcessor()) {
             return processor;
         }
@@ -482,7 +520,8 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
     private boolean configureSecurityContext() {
         if (securityContext == DenyAllSecurityContext.INSTANCE) {
-            final long authenticationStart = configuration.getNanosecondClock().getTicks();
+            final NanosecondClock clock = configuration.getHttpContextConfiguration().getNanosecondClock();
+            final long authenticationStart = clock.getTicks();
             if (!authenticator.authenticate(headerParser)) {
                 // authenticationNanos stays 0, when it fails this value is irrelevant
                 return false;
@@ -493,7 +532,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                     authenticator.getAuthType(),
                     SecurityContextFactory.HTTP
             );
-            authenticationNanos = configuration.getNanosecondClock().getTicks() - authenticationStart;
+            authenticationNanos = clock.getTicks() - authenticationStart;
         }
         return true;
     }
@@ -525,7 +564,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                     // done
                     processor.onRequestComplete(this);
                     reset();
-                    if (configuration.getServerKeepAlive()) {
+                    if (configuration.getHttpContextConfiguration().getServerKeepAlive()) {
                         return true;
                     } else {
                         return disconnectHttp(processor, DISCONNECT_REASON_KEEPALIVE_OFF_RECV);
@@ -609,7 +648,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
                     processor.onRequestComplete(this);
                     reset();
-                    if (configuration.getServerKeepAlive()) {
+                    if (configuration.getHttpContextConfiguration().getServerKeepAlive()) {
                         return true;
                     } else {
                         return disconnectHttp(processor, DISCONNECT_REASON_KEEPALIVE_OFF_RECV);
@@ -862,8 +901,11 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             final boolean multipartProcessor = processor instanceof HttpMultipartContentListener;
 
             DirectUtf8Sequence acceptEncoding = headerParser.getHeader(HEADER_CONTENT_ACCEPT_ENCODING);
-            if (configuration.allowDeflateBeforeSend() && acceptEncoding != null && Utf8s.containsAscii(acceptEncoding, "gzip")) {
-                responseSink.setDeflateBeforeSend(true);
+            if (configuration.getHttpContextConfiguration().allowDeflateBeforeSend()
+                    && acceptEncoding != null
+                    && Utf8s.containsAscii(acceptEncoding, "gzip")) {
+                // re-read send buffer size in case the config was reloaded
+                responseSink.setDeflateBeforeSend(true, configuration.getSendBufferSize());
             }
 
             try {
@@ -873,7 +915,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                         processor = rejectRequest(HTTP_UNAUTHORIZED, requiredAuthType);
                     }
 
-                    if (configuration.areCookiesEnabled()) {
+                    if (configuration.getHttpContextConfiguration().areCookiesEnabled()) {
                         if (!processor.processCookies(this, securityContext)) {
                             processor = rejectProcessor;
                         }

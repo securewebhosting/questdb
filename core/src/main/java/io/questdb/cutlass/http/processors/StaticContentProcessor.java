@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,15 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.cairo.SecurityContext;
-import io.questdb.cutlass.http.*;
+import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
+import io.questdb.cutlass.http.HttpRangeParser;
+import io.questdb.cutlass.http.HttpRawSocket;
+import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestProcessor;
+import io.questdb.cutlass.http.HttpResponseHeader;
+import io.questdb.cutlass.http.LocalValue;
+import io.questdb.cutlass.http.MimeTypesCache;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.log.LogRecord;
@@ -35,7 +43,12 @@ import io.questdb.std.FilesFacade;
 import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
-import io.questdb.std.str.*;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.FileNameExtractorUtf8Sequence;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.PrefixedPath;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8s;
 
 import java.io.Closeable;
 
@@ -53,7 +66,7 @@ public class StaticContentProcessor implements HttpRequestProcessor, Closeable {
     private final HttpRangeParser rangeParser = new HttpRangeParser();
     private final byte requiredAuthType;
 
-    public StaticContentProcessor(HttpServerConfiguration configuration) {
+    public StaticContentProcessor(HttpFullFatServerConfiguration configuration) {
         this.mimeTypes = configuration.getStaticContentProcessorConfiguration().getMimeTypesCache();
         this.prefixedPath = new PrefixedPath(configuration.getStaticContentProcessorConfiguration().getPublicDirectory());
         this.indexFileName = configuration.getStaticContentProcessorConfiguration().getIndexFileName();
@@ -94,10 +107,10 @@ public class StaticContentProcessor implements HttpRequestProcessor, Closeable {
                 path.concat(url);
             }
 
-            path.$();
+            LPSZ lpsz = path.$();
 
-            if (ff.exists(path)) {
-                send(context, path, headers.getUrlParam(URL_PARAM_ATTACHMENT) != null);
+            if (ff.exists(lpsz)) {
+                send(context, lpsz, headers.getUrlParam(URL_PARAM_ATTACHMENT) != null);
             } else {
                 logInfoWithFd(context).$("not found [path=").$(path).$(']').$();
                 sendStatusTextContent(context, 404);
@@ -237,7 +250,7 @@ public class StaticContentProcessor implements HttpRequestProcessor, Closeable {
             CharSequence contentType,
             boolean asAttachment
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        int fd = ff.openRO(path);
+        long fd = ff.openRO(path);
         if (fd == -1) {
             LOG.info().$("Cannot open file: ").$(path).$('(').$(ff.errno()).$(')').$();
             sendStatusTextContent(context, 404);

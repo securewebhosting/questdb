@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,13 +24,33 @@
 
 package io.questdb.cutlass.http;
 
-import io.questdb.Metrics;
+import io.questdb.ServerConfiguration;
 import io.questdb.cairo.CairoEngine;
-import io.questdb.cutlass.http.processors.*;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cutlass.http.processors.LineHttpPingProcessor;
+import io.questdb.cutlass.http.processors.LineHttpProcessorConfiguration;
+import io.questdb.cutlass.http.processors.SettingsProcessor;
+import io.questdb.cutlass.http.processors.StaticContentProcessor;
+import io.questdb.cutlass.http.processors.TableStatusCheckProcessor;
+import io.questdb.cutlass.http.processors.TextImportProcessor;
+import io.questdb.cutlass.http.processors.TextQueryProcessor;
+import io.questdb.cutlass.http.processors.WarningsProcessor;
 import io.questdb.mp.Job;
 import io.questdb.mp.WorkerPool;
-import io.questdb.network.*;
+import io.questdb.network.HeartBeatException;
+import io.questdb.network.IOContextFactoryImpl;
+import io.questdb.network.IODispatcher;
+import io.questdb.network.IODispatchers;
+import io.questdb.network.IOOperation;
+import io.questdb.network.IORequestProcessor;
+import io.questdb.network.PeerIsSlowToReadException;
+import io.questdb.network.PeerIsSlowToWriteException;
+import io.questdb.network.ServerDisconnectException;
+import io.questdb.network.SocketFactory;
+import io.questdb.std.AssociativeCache;
+import io.questdb.std.ConcurrentAssociativeCache;
 import io.questdb.std.Misc;
+import io.questdb.std.NoOpAssociativeCache;
 import io.questdb.std.ObjList;
 import io.questdb.std.Utf8SequenceObjHashMap;
 import io.questdb.std.str.Utf8Sequence;
@@ -40,26 +60,32 @@ import org.jetbrains.annotations.NotNull;
 import java.io.Closeable;
 
 public class HttpServer implements Closeable {
-
+    static final NoOpAssociativeCache<RecordCursorFactory> NO_OP_CACHE = new NoOpAssociativeCache<>();
     private final ObjList<Closeable> closeables = new ObjList<>();
     private final IODispatcher<HttpConnectionContext> dispatcher;
     private final HttpContextFactory httpContextFactory;
     private final WaitProcessor rescheduleContext;
+    private final AssociativeCache<RecordCursorFactory> selectCache;
     private final ObjList<HttpRequestProcessorSelectorImpl> selectors;
     private final int workerCount;
 
+    // used for min http server only
     public HttpServer(
-            HttpMinServerConfiguration configuration,
-            Metrics metrics,
+            HttpServerConfiguration configuration,
             WorkerPool pool,
             SocketFactory socketFactory
     ) {
-        this(configuration, metrics, pool, socketFactory, DefaultHttpCookieHandler.INSTANCE, DefaultHttpHeaderParserFactory.INSTANCE);
+        this(
+                configuration,
+                pool,
+                socketFactory,
+                DefaultHttpCookieHandler.INSTANCE,
+                DefaultHttpHeaderParserFactory.INSTANCE
+        );
     }
 
     public HttpServer(
-            HttpMinServerConfiguration configuration,
-            Metrics metrics,
+            HttpServerConfiguration configuration,
             WorkerPool pool,
             SocketFactory socketFactory,
             HttpCookieHandler cookieHandler,
@@ -72,16 +98,29 @@ public class HttpServer implements Closeable {
             selectors.add(new HttpRequestProcessorSelectorImpl());
         }
 
-        this.httpContextFactory = new HttpContextFactory(configuration, metrics, socketFactory, cookieHandler, headerParserFactory);
-        this.dispatcher = IODispatchers.create(configuration.getDispatcherConfiguration(), httpContextFactory);
+        if (configuration instanceof HttpFullFatServerConfiguration) {
+            final HttpFullFatServerConfiguration serverConfiguration = (HttpFullFatServerConfiguration) configuration;
+            if (serverConfiguration.isQueryCacheEnabled()) {
+                this.selectCache = new ConcurrentAssociativeCache<>(serverConfiguration.getConcurrentCacheConfiguration());
+            } else {
+                this.selectCache = NO_OP_CACHE;
+            }
+        } else {
+            // Min server doesn't need select cache, so we use no-op impl.
+            this.selectCache = NO_OP_CACHE;
+        }
+
+        this.httpContextFactory = new HttpContextFactory(configuration, socketFactory, cookieHandler, headerParserFactory, selectCache);
+        this.dispatcher = IODispatchers.create(configuration, httpContextFactory);
         pool.assign(dispatcher);
         this.rescheduleContext = new WaitProcessor(configuration.getWaitProcessorConfiguration(), dispatcher);
-        pool.assign(this.rescheduleContext);
+        pool.assign(rescheduleContext);
 
         for (int i = 0; i < workerCount; i++) {
             final int index = i;
 
             pool.assign(i, new Job() {
+
                 private final HttpRequestProcessorSelector selector = selectors.getQuick(index);
                 private final IORequestProcessor<HttpConnectionContext> processor =
                         (operation, context, dispatcher) -> handleClientOperation(context, operation, selector, rescheduleContext, dispatcher);
@@ -102,16 +141,17 @@ public class HttpServer implements Closeable {
 
     public static void addDefaultEndpoints(
             HttpServer server,
-            HttpServerConfiguration configuration,
+            ServerConfiguration serverConfiguration,
             CairoEngine cairoEngine,
             WorkerPool workerPool,
             int sharedWorkerCount,
             HttpRequestProcessorBuilder jsonQueryProcessorBuilder,
             HttpRequestProcessorBuilder ilpWriteProcessorBuilderV2
     ) {
+        final HttpFullFatServerConfiguration httpServerConfiguration = serverConfiguration.getHttpServerConfiguration();
+        final LineHttpProcessorConfiguration lineHttpProcessorConfiguration = httpServerConfiguration.getLineHttpProcessorConfiguration();
         // Disable ILP HTTP if the instance configured to be read-only for HTTP requests
-        if (configuration.getLineHttpProcessorConfiguration().isEnabled() &&
-                !configuration.getHttpContextConfiguration().readOnlySecurityContext()) {
+        if (httpServerConfiguration.isEnabled() && lineHttpProcessorConfiguration.isEnabled() && !httpServerConfiguration.getHttpContextConfiguration().readOnlySecurityContext()) {
             server.bind(new HttpRequestProcessorFactory() {
                 @Override
                 public String getUrl() {
@@ -137,7 +177,7 @@ public class HttpServer implements Closeable {
             });
 
             LineHttpPingProcessor pingProcessor = new LineHttpPingProcessor(
-                    configuration.getLineHttpProcessorConfiguration().getInfluxPingVersion()
+                    httpServerConfiguration.getLineHttpProcessorConfiguration().getInfluxPingVersion()
             );
             server.bind(new HttpRequestProcessorFactory() {
                 @Override
@@ -152,7 +192,7 @@ public class HttpServer implements Closeable {
             });
         }
 
-        final SettingsProcessor settingsProcessor = new SettingsProcessor(cairoEngine.getConfiguration());
+        final SettingsProcessor settingsProcessor = new SettingsProcessor(serverConfiguration);
         server.bind(new HttpRequestProcessorFactory() {
             @Override
             public String getUrl() {
@@ -162,6 +202,19 @@ public class HttpServer implements Closeable {
             @Override
             public HttpRequestProcessor newInstance() {
                 return settingsProcessor;
+            }
+        });
+
+        final WarningsProcessor warningsProcessor = new WarningsProcessor(serverConfiguration.getCairoConfiguration());
+        server.bind(new HttpRequestProcessorFactory() {
+            @Override
+            public String getUrl() {
+                return "/warnings";
+            }
+
+            @Override
+            public HttpRequestProcessor newInstance() {
+                return warningsProcessor;
             }
         });
 
@@ -185,7 +238,7 @@ public class HttpServer implements Closeable {
 
             @Override
             public HttpRequestProcessor newInstance() {
-                return new TextImportProcessor(cairoEngine, configuration.getJsonQueryProcessorConfiguration());
+                return new TextImportProcessor(cairoEngine, httpServerConfiguration.getJsonQueryProcessorConfiguration());
             }
         });
 
@@ -198,7 +251,7 @@ public class HttpServer implements Closeable {
             @Override
             public HttpRequestProcessor newInstance() {
                 return new TextQueryProcessor(
-                        configuration.getJsonQueryProcessorConfiguration(),
+                        httpServerConfiguration.getJsonQueryProcessorConfiguration(),
                         cairoEngine,
                         workerPool.getWorkerCount(),
                         sharedWorkerCount
@@ -214,19 +267,19 @@ public class HttpServer implements Closeable {
 
             @Override
             public HttpRequestProcessor newInstance() {
-                return new TableStatusCheckProcessor(cairoEngine, configuration.getJsonQueryProcessorConfiguration());
+                return new TableStatusCheckProcessor(cairoEngine, httpServerConfiguration.getJsonQueryProcessorConfiguration());
             }
         });
 
         server.bind(new HttpRequestProcessorFactory() {
             @Override
             public String getUrl() {
-                return HttpServerConfiguration.DEFAULT_PROCESSOR_URL;
+                return HttpFullFatServerConfiguration.DEFAULT_PROCESSOR_URL;
             }
 
             @Override
             public HttpRequestProcessor newInstance() {
-                return new StaticContentProcessor(configuration);
+                return new StaticContentProcessor(httpServerConfiguration);
             }
         });
     }
@@ -240,7 +293,7 @@ public class HttpServer implements Closeable {
         assert url != null;
         for (int i = 0; i < workerCount; i++) {
             HttpRequestProcessorSelectorImpl selector = selectors.getQuick(i);
-            if (HttpServerConfiguration.DEFAULT_PROCESSOR_URL.equals(url)) {
+            if (HttpFullFatServerConfiguration.DEFAULT_PROCESSOR_URL.equals(url)) {
                 selector.defaultRequestProcessor = factory.newInstance();
             } else {
                 final HttpRequestProcessor processor = factory.newInstance();
@@ -252,6 +305,10 @@ public class HttpServer implements Closeable {
         }
     }
 
+    public void clearSelectCache() {
+        selectCache.clear();
+    }
+
     @Override
     public void close() {
         Misc.free(dispatcher);
@@ -259,6 +316,7 @@ public class HttpServer implements Closeable {
         Misc.freeObjListAndClear(selectors);
         Misc.freeObjListAndClear(closeables);
         Misc.free(httpContextFactory);
+        Misc.free(selectCache);
     }
 
     public int getPort() {
@@ -290,9 +348,16 @@ public class HttpServer implements Closeable {
     }
 
     private static class HttpContextFactory extends IOContextFactoryImpl<HttpConnectionContext> {
-        public HttpContextFactory(HttpMinServerConfiguration configuration, Metrics metrics, SocketFactory socketFactory, HttpCookieHandler cookieHandler, HttpHeaderParserFactory headerParserFactory) {
+
+        public HttpContextFactory(
+                HttpServerConfiguration configuration,
+                SocketFactory socketFactory,
+                HttpCookieHandler cookieHandler,
+                HttpHeaderParserFactory headerParserFactory,
+                AssociativeCache<RecordCursorFactory> selectCache
+        ) {
             super(
-                    () -> new HttpConnectionContext(configuration, metrics, socketFactory, cookieHandler, headerParserFactory),
+                    () -> new HttpConnectionContext(configuration, socketFactory, cookieHandler, headerParserFactory, selectCache),
                     configuration.getHttpContextConfiguration().getConnectionPoolInitialCapacity()
             );
         }

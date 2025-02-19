@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,11 @@ package io.questdb;
 
 public final class TelemetrySystemEvent {
     public static final short ILP_RESERVE_WRITER = 102;
+    public static final short MAT_VIEW_CREATE = 200;
+    public static final short MAT_VIEW_DROP = 201;
+    public static final short MAT_VIEW_INVALIDATE = 202;
+    public static final short MAT_VIEW_REFRESH_FAIL = 203;
+    public static final short MAT_VIEW_REFRESH_SUCCESS = 204;
     // CPU classes: -20 - 1-4 cores, -21 - 5-8 cores, -22 - 9-16 cores, -23 - 17-32 cores, -24 - 33-64 cores, -25 - 65+ cores
     public static final short SYSTEM_CPU_CLASS_BASE = -20;
     // DB size classes: -30 - <10GB, -31 - (10GB,50GB], -32 - (50GB,100GB], -33 - (100GB,500GB], -34 - (500GB,1TB], -35 - (1TB,5TB], -36 - (5TB,10TB], -37 - >10TB
